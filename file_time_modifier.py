@@ -5,8 +5,8 @@ import datetime
 import glob
 import platform
 import tempfile
-import shutil
-from typing import List, Optional, Tuple, Dict
+import fnmatch
+from typing import List, Optional, Tuple, Dict, Iterable
 
 IS_WINDOWS = platform.system() == 'Windows'
 
@@ -332,26 +332,96 @@ def parse_offset(offset_str: str) -> datetime.timedelta:
     )
 
 
-def get_files(paths: List[str], recursive: bool = False) -> List[str]:
+def normalize_pattern(pattern: str) -> str:
+    if IS_WINDOWS:
+        return pattern.lower()
+    return pattern
+
+
+def match_any_pattern(filename: str, patterns: Iterable[str]) -> bool:
+    filename_norm = normalize_pattern(filename)
+    for pattern in patterns:
+        pattern_norm = normalize_pattern(pattern)
+        if fnmatch.fnmatch(filename_norm, pattern_norm):
+            return True
+    return False
+
+
+def match_extension(filename: str, extensions: Iterable[str]) -> bool:
+    _, ext = os.path.splitext(filename)
+    ext_norm = normalize_pattern(ext)
+    for target_ext in extensions:
+        if not target_ext.startswith('.'):
+            target_ext = '.' + target_ext
+        target_norm = normalize_pattern(target_ext)
+        if ext_norm == target_norm:
+            return True
+    return False
+
+
+def should_include_file(
+    filepath: str,
+    include_patterns: Optional[List[str]] = None,
+    exclude_patterns: Optional[List[str]] = None,
+    include_extensions: Optional[List[str]] = None,
+    exclude_extensions: Optional[List[str]] = None
+) -> bool:
+    filename = os.path.basename(filepath)
+
+    if exclude_patterns and match_any_pattern(filename, exclude_patterns):
+        return False
+
+    if exclude_extensions and match_extension(filename, exclude_extensions):
+        return False
+
+    if include_patterns and not match_any_pattern(filename, include_patterns):
+        return False
+
+    if include_extensions and not match_extension(filename, include_extensions):
+        return False
+
+    return True
+
+
+def get_files(
+    paths: List[str],
+    recursive: bool = False,
+    include_patterns: Optional[List[str]] = None,
+    exclude_patterns: Optional[List[str]] = None,
+    include_extensions: Optional[List[str]] = None,
+    exclude_extensions: Optional[List[str]] = None
+) -> List[str]:
     files = []
     for path in paths:
         if os.path.isfile(path):
-            files.append(os.path.abspath(path))
+            abs_path = os.path.abspath(path)
+            if should_include_file(abs_path, include_patterns, exclude_patterns,
+                                   include_extensions, exclude_extensions):
+                files.append(abs_path)
         elif os.path.isdir(path):
             if recursive:
                 for root, _, filenames in os.walk(path):
                     for filename in filenames:
-                        files.append(os.path.abspath(os.path.join(root, filename)))
+                        full_path = os.path.abspath(os.path.join(root, filename))
+                        if should_include_file(full_path, include_patterns, exclude_patterns,
+                                               include_extensions, exclude_extensions):
+                            files.append(full_path)
             else:
                 for entry in os.listdir(path):
                     full_path = os.path.join(path, entry)
                     if os.path.isfile(full_path):
-                        files.append(os.path.abspath(full_path))
+                        abs_path = os.path.abspath(full_path)
+                        if should_include_file(abs_path, include_patterns, exclude_patterns,
+                                               include_extensions, exclude_extensions):
+                            files.append(abs_path)
         else:
             matched = glob.glob(path)
             for match in matched:
                 if os.path.isfile(match):
-                    files.append(os.path.abspath(match))
+                    abs_path = os.path.abspath(match)
+                    if should_include_file(abs_path, include_patterns, exclude_patterns,
+                                           include_extensions, exclude_extensions):
+                        files.append(abs_path)
     return list(set(files))
 
 
@@ -438,12 +508,31 @@ def batch_modify(
     mtime: Optional[datetime.datetime] = None,
     ctime: Optional[datetime.datetime] = None,
     offset: Optional[datetime.timedelta] = None,
-    dry_run: bool = False
+    dry_run: bool = False,
+    include_patterns: Optional[List[str]] = None,
+    exclude_patterns: Optional[List[str]] = None,
+    include_extensions: Optional[List[str]] = None,
+    exclude_extensions: Optional[List[str]] = None
 ) -> None:
-    files = get_files(paths, recursive)
+    files = get_files(paths, recursive, include_patterns, exclude_patterns,
+                      include_extensions, exclude_extensions)
+
+    filter_info = []
+    if include_patterns:
+        filter_info.append(f"包含模式: {', '.join(include_patterns)}")
+    if exclude_patterns:
+        filter_info.append(f"排除模式: {', '.join(exclude_patterns)}")
+    if include_extensions:
+        filter_info.append(f"包含扩展名: {', '.join(include_extensions)}")
+    if exclude_extensions:
+        filter_info.append(f"排除扩展名: {', '.join(exclude_extensions)}")
+    if recursive:
+        filter_info.append("递归处理子目录")
+    if filter_info:
+        print(f"[筛选条件] {', '.join(filter_info)}")
 
     if not files:
-        print("未找到任何文件")
+        print("未找到任何匹配的文件")
         return
 
     fs_cache: Dict[str, int] = {}
@@ -512,6 +601,10 @@ def batch_modify(
         print(f"批量修改完成，成功: {success_count}, 失败: {fail_count}, 共处理 {len(files)} 个文件")
 
 
+def _parse_comma_list(value: str) -> List[str]:
+    return [item.strip() for item in value.split(',') if item.strip()]
+
+
 def main():
     parser = argparse.ArgumentParser(
         description='批量修改文件时间属性（创建时间、修改时间、访问时间） - 支持跨文件系统高精度',
@@ -539,6 +632,24 @@ def main():
   # 使用通配符
   python file_time_modifier.py ./test_files/*.txt --time "2024-01-01"
 
+  # 按扩展名筛选（仅修改 txt 文件）
+  python file_time_modifier.py ./test_files --ext ".txt" --time "2024-01-01"
+
+  # 按扩展名筛选（多个扩展名）
+  python file_time_modifier.py ./test_files --ext "txt,pdf,doc" --time "2024-01-01"
+
+  # 按文件名模式匹配
+  python file_time_modifier.py ./test_files --include "report_*.pdf" --time "2024-01-01"
+
+  # 多个包含模式
+  python file_time_modifier.py ./test_files --include "*.txt,*.pdf" --time "2024-01-01"
+
+  # 排除模式（排除临时文件）
+  python file_time_modifier.py ./test_files --exclude "*.tmp,*.log" --offset "-7d"
+
+  # 组合筛选：递归 + 扩展名 + 排除模式
+  python file_time_modifier.py ./docs -r --ext ".txt,.md" --exclude "*draft*" --offset "+3d"
+
   # 仅修改创建时间（Windows 系统）
   python file_time_modifier.py ./test_files --ctime "2024-06-01 00:00:00"
         """
@@ -554,6 +665,15 @@ def main():
     parser.add_argument('--ctime', type=str, help='创建时间（仅 Windows），格式: YYYY-MM-DD [HH:MM:SS]')
 
     parser.add_argument('--offset', type=str, help='时间偏移量，如 -7d, +3d12h, -2h30m')
+
+    parser.add_argument('--include', type=_parse_comma_list, metavar='PATTERNS',
+                        help='包含文件名模式，多个用逗号分隔，如: *.txt,report_*.pdf')
+    parser.add_argument('--exclude', type=_parse_comma_list, metavar='PATTERNS',
+                        help='排除文件名模式，多个用逗号分隔，如: *.tmp,*.log')
+    parser.add_argument('--ext', type=_parse_comma_list, metavar='EXTENSIONS',
+                        help='包含文件扩展名，多个用逗号分隔，如: .txt,pdf,doc')
+    parser.add_argument('--exclude-ext', type=_parse_comma_list, metavar='EXTENSIONS',
+                        help='排除文件扩展名，多个用逗号分隔，如: .tmp,log')
 
     args = parser.parse_args()
 
@@ -579,7 +699,11 @@ def main():
         mtime=mtime,
         ctime=ctime,
         offset=offset,
-        dry_run=args.dry_run
+        dry_run=args.dry_run,
+        include_patterns=args.include,
+        exclude_patterns=args.exclude,
+        include_extensions=args.ext,
+        exclude_extensions=args.exclude_ext
     )
 
 
